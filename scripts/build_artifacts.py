@@ -1,21 +1,20 @@
 #!/usr/bin/env python3
 """Build datasources artifacts from the single source of truth.
 
-character.json (20-field consumer contract) is the SOLE source of truth.
-SQLite and PostgreSQL artifacts are deterministic DERIVED products: given the
-same JSON they produce byte-identical output (modulo SQLite metadata). This
-prevents the three-form distribution from becoming three sources of truth —
-the exact failure mode that a multi-form data supply invites.
+character.json (20-field consumer contract) is the SOLE data contract.
+character.pg.sql is a convenience DERIVED loader script for qiming's PostgreSQL
+runtime — it is NOT a second contract and NOT a database artifact to be shipped
+as consumer data. Per docs/ARCH_CONTRACT.md: databases are runtime products;
+datasources never distributes a database file (sqlite3/pg dump).
 
 Artifacts:
-    dist/character.json       - canonical CSV/JSON form (the input)
-    dist/character.sqlite3    - neutral 20-column SQLite table for fate/qiming loaders
-    dist/character.pg.sql     - PostgreSQL DDL + COPY-ready INSERT statements
+    dist/character.json       - canonical 20-field JSON (THE contract)
+    dist/character.pg.sql     - PG loader script for qiming runtime (derived, idempotent)
     dist/MANIFEST.json        - sha256 + row counts for every artifact
 
-Consumers map the neutral 20-column table onto their own ent schema:
-    fate (CE): 20 fields == its contract, direct load via dbinit
-    qiming (EE): superset (23 fields); load 20, let ent defaults fill the rest
+Consumers:
+    fate (CE): embeds character.json, builds its runtime sqlite via cmd/dbinit
+    qiming (EE): loads character.pg.sql into its runtime PG (or embeds JSON for local sqlite)
 
 Usage:
     python3 scripts/build_artifacts.py --source /path/to/character.json
@@ -26,7 +25,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import sqlite3
 import sys
 from pathlib import Path
 from typing import Any
@@ -87,7 +85,8 @@ def _sql_literal(value: Any, column: str, dialect: str = "sqlite") -> str:
     """
     if value is None:
         return "NULL"
-    if column in BOOL_COLUMNS:
+    column_type = dict(COLUMNS)[column]
+    if column in BOOL_COLUMNS or (isinstance(value, bool) and column_type.startswith("INTEGER")):
         if dialect == "pg":
             return "TRUE" if value else "FALSE"
         return "1" if value else "0"
@@ -95,10 +94,6 @@ def _sql_literal(value: Any, column: str, dialect: str = "sqlite") -> str:
         items = value if isinstance(value, list) else []
         return "'" + json.dumps(items, ensure_ascii=False,
                                 separators=(",", ":")).replace("'", "''") + "'"
-    if isinstance(value, bool):
-        if dialect == "pg":
-            return "TRUE" if value else "FALSE"
-        return "1" if value else "0"
     if isinstance(value, (int, float)):
         return str(value)
     return "'" + str(value).replace("'", "''") + "'"
@@ -110,37 +105,6 @@ def load_source(path: Path) -> list[dict[str, Any]]:
     if not isinstance(data, list):
         raise SystemExit(f"source root is {type(data).__name__}, expected list")
     return data
-
-
-def build_sqlite(records: list[dict[str, Any]], out: Path) -> dict[str, Any]:
-    out.parent.mkdir(parents=True, exist_ok=True)
-    if out.exists():
-        out.unlink()
-    con = sqlite3.connect(out)
-    cols = ", ".join(f'"{n}" {t}' for n, t in COLUMNS)
-    con.execute(f"CREATE TABLE character ({cols})")
-    con.execute("CREATE UNIQUE INDEX idx_character_char ON character(char)")
-    con.execute("CREATE INDEX idx_character_wu_xing ON character(wu_xing)")
-    names = ", ".join(f'"{n}"' for n, _ in COLUMNS)
-    placeholders = ", ".join("?" for _ in COLUMNS)
-    rows = [
-        tuple(_sqlite_value(r.get(n), n) for n, _ in COLUMNS)
-        for r in records
-    ]
-    con.executemany(f"INSERT INTO character ({names}) VALUES ({placeholders})", rows)
-    con.commit()
-    con.close()
-    return {"rows": len(rows), "sha256": sha256(out)}
-
-
-def _sqlite_value(value: Any, column: str) -> Any:
-    if value is None:
-        return None
-    if column in BOOL_COLUMNS:
-        return 1 if value else 0
-    if column == "pinyin":
-        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
-    return value
 
 
 def build_pg_sql(records: list[dict[str, Any]], out: Path) -> dict[str, Any]:
@@ -194,12 +158,11 @@ def verify_artifacts(dist: Path, manifest: dict[str, Any]) -> list[str]:
             continue
         if sha256(p) != meta["sha256"]:
             errors.append(f"{name}: sha256 drift")
-        if name.endswith(".sqlite3"):
-            con = sqlite3.connect(p)
-            n = con.execute("SELECT count(*) FROM character").fetchone()[0]
-            con.close()
-            if n != meta["rows"]:
-                errors.append(f"{name}: rows {n} != {meta['rows']}")
+        if name.endswith(".pg.sql"):
+            text = p.read_text(encoding="utf-8")
+            inserts = sum(1 for ln in text.splitlines() if ln.startswith("INSERT INTO"))
+            if inserts != meta["rows"]:
+                errors.append(f"{name}: rows {inserts} != {meta['rows']}")
     return errors
 
 
@@ -214,18 +177,18 @@ def build(source: Path, dist: Path) -> int:
         json.dumps(records, ensure_ascii=False, separators=(",", ":")) + "\n",
         encoding="utf-8",
     )
-    sqlite3_meta = build_sqlite(records, dist / "character.sqlite3")
     pg_meta = build_pg_sql(records, dist / "character.pg.sql")
     manifest = {
         "source": str(source),
         "row_count": len(records),
         "column_count": len(COLUMNS),
+        "contract": "character.json",
+        "derived_loader": "character.pg.sql (qiming PG runtime only; not a data contract)",
         "columns": [n for n, _ in COLUMNS],
         "pg_columns": PG_COLUMNS,
         "pg_excluded": [n for n, _ in COLUMNS if n not in PG_COLUMNS],
         "artifacts": {
             "character.json": {"rows": len(records), "sha256": sha256(canonical)},
-            "character.sqlite3": sqlite3_meta,
             "character.pg.sql": pg_meta,
         },
     }
@@ -235,7 +198,7 @@ def build(source: Path, dist: Path) -> int:
     errors = verify_artifacts(dist, manifest)
     print(f"source  : {source}")
     print(f"rows    : {len(records)}")
-    print(f"sqlite  : {sqlite3_meta['sha256'][:12]}  rows={sqlite3_meta['rows']}")
+    print(f"contract: {manifest['artifacts']['character.json']['sha256'][:12]}")
     print(f"pg sql  : {pg_meta['sha256'][:12]}  rows={pg_meta['rows']}")
     if errors:
         print(f"FAIL    : {len(errors)} error(s)")
@@ -267,12 +230,16 @@ def self_test() -> int:
         d1, d2 = root / "d1", root / "d2"
         build(src, d1)
         build(src, d2)
-        for name in ("character.sqlite3", "character.pg.sql", "character.json"):
+        for name in ("character.pg.sql", "character.json"):
             a, b = sha256(d1 / name), sha256(d2 / name)
             ok = a == b
             print(f"  {'PASS' if ok else 'FAIL'}  deterministic: {name}")
             if not ok:
                 failures += 1
+        ok = not any((d1 / n).exists() for n in ("character.sqlite3", "character.db"))
+        print(f"  {'PASS' if ok else 'FAIL'}  must-miss: no database file shipped as data")
+        if not ok:
+            failures += 1
         m1 = json.loads((d1 / "MANIFEST.json").read_text(encoding="utf-8"))
         ok = not verify_artifacts(d1, m1)
         print(f"  {'PASS' if ok else 'FAIL'}  must-miss: clean artifacts")
@@ -289,17 +256,9 @@ def self_test() -> int:
               and "'[\"mù\"]'" in pg and "nameable BOOLEAN" in pg
               and "pinyin JSONB" in pg and ", TRUE," in pg
               and "ARRAY[" not in pg
-              and "radical_stroke " not in pg.split("CREATE UNIQUE INDEX")[0])
-        print(f"  {'PASS' if ok else 'FAIL'}  pg sql: qiming 16 scalars + JSONB dialect")
-        if not ok:
-            failures += 1
-        sq = sqlite3.connect(d2 / "character.sqlite3")
-        row = sq.execute(
-            "SELECT nameable, pinyin FROM character WHERE char = '木'"
-        ).fetchone()
-        sq.close()
-        ok = row == (1, '["mù"]')
-        print(f"  {'PASS' if ok else 'FAIL'}  sqlite dialect: 0/1 + JSON text")
+              and "radical_stroke " not in pg.split("CREATE UNIQUE INDEX")[0]
+              and "ON CONFLICT (char) DO NOTHING" in pg)
+        print(f"  {'PASS' if ok else 'FAIL'}  pg loader: qiming 16 scalars + JSONB + idempotent")
         if not ok:
             failures += 1
     print(f"== self-test: {'PASS' if failures == 0 else str(failures) + ' failures'} ==")

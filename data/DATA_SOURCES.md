@@ -42,4 +42,4 @@
 | **Location** | `dist/character.json` (this repo); consumed as `resources/character.json` in fate |
 | **Status** | Derived artifact (gitignored, distributed via GitHub Releases, ~12MB) |
 | **Built from** | Unihan + xinhua + manual curation |
-| **Role** | The central character database — sole source of truth; sqlite3 / pg.sql are deterministically derived from it |
+| **Role** | The sole data contract (20 fields). `pg.sql` is a derived, idempotent PG loader for qiming's runtime — not a second contract. Runtime databases are owned by consumers (fate dbinit / qiming PG). |
