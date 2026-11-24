@@ -1,0 +1,6 @@
+#!/usr/bin/env sh
+# DATASOURCES commit-msg gate: English, conventional, LF only.
+# Rule mirrors fate/scripts/check_repo.py and qiming/scripts/check_arch.py.
+set -e
+ROOT=$(git rev-parse --show-toplevel)
+exec python "$ROOT/scripts/check_commit_msg.py" --file "$1"
